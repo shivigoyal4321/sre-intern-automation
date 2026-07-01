@@ -1,0 +1,96 @@
+# provision-poll.yml — Track A pipeline (POLL trigger, the easy fallback).
+#
+# No Flow Designer / Outbound REST / PAT needed. This workflow runs on a schedule,
+# asks ServiceNow for new approved RITMs, and processes the first one it finds.
+# Same fetch -> terraform -> write-back logic as provision.yml.
+#
+# NOTE: the schedule's shortest practical interval is ~5-15 min. Use workflow_dispatch
+# to run it on demand while developing.
+
+name: provision-vm-poll
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"   # every 15 minutes
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  SNOW_INSTANCE: ${{ secrets.SNOW_INSTANCE }}
+  SNOW_USER: ${{ secrets.SNOW_USER }}
+  SNOW_PASSWORD: ${{ secrets.SNOW_PASSWORD }}
+  ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+  ARM_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+  ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+  ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+jobs:
+  poll-and-provision:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r scripts/requirements.txt
+
+      # Find one RITM in the "ready to provision" state. Adjust the query to match
+      # your catalog item + the state your approval flow sets (e.g. state=2 = Work in Progress).
+      - name: Find next request
+        id: find
+        run: |
+          NUMBER=$(python - <<'PY'
+          import os, requests
+          inst=os.environ["SNOW_INSTANCE"]; auth=(os.environ["SNOW_USER"],os.environ["SNOW_PASSWORD"])
+          # cat_item.name is the catalog item; tweak to your item name
+          q="stateIN1,2^cat_item.name=Request a Virtual Machine^ORDERBYsys_created_on"
+          r=requests.get(f"https://{inst}.service-now.com/api/now/table/sc_req_item",
+                         auth=auth, params={"sysparm_query":q,"sysparm_limit":1,"sysparm_fields":"number"})
+          r.raise_for_status(); res=r.json()["result"]
+          print(res[0]["number"] if res else "")
+          PY
+          )
+          echo "number=$NUMBER" >> "$GITHUB_OUTPUT"
+          if [ -z "$NUMBER" ]; then echo "No pending requests."; fi
+
+      - name: Fetch RITM details
+        if: steps.find.outputs.number != ''
+        id: fetch
+        env:
+          RITM_NUMBER: ${{ steps.find.outputs.number }}
+        run: python scripts/fetch_request.py
+
+      - uses: hashicorp/setup-terraform@v3
+        if: steps.find.outputs.number != ''
+
+      - name: Write SSH public key tfvar
+        if: steps.find.outputs.number != ''
+        run: |
+          echo "ssh_public_key = \"${{ secrets.VM_SSH_PUBLIC_KEY }}\"" >> terraform/terraform.tfvars
+
+      - name: Terraform apply
+        if: steps.find.outputs.number != ''
+        working-directory: terraform
+        run: terraform init && terraform apply -auto-approve
+
+      - name: Capture outputs
+        if: steps.find.outputs.number != ''
+        id: tf
+        working-directory: terraform
+        run: |
+          echo "vm_name=$(terraform output -raw vm_name)" >> "$GITHUB_OUTPUT"
+          echo "private_ip=$(terraform output -raw private_ip)" >> "$GITHUB_OUTPUT"
+          echo "vm_size=$(terraform output -raw vm_size)" >> "$GITHUB_OUTPUT"
+          echo "location=$(terraform output -raw location)" >> "$GITHUB_OUTPUT"
+
+      - name: Update ServiceNow
+        if: steps.find.outputs.number != ''
+        env:
+          RITM_SYS_ID: ${{ steps.fetch.outputs.ritm_sys_id }}
+          VM_NAME: ${{ steps.tf.outputs.vm_name }}
+          VM_IP: ${{ steps.tf.outputs.private_ip }}
+          VM_SIZE: ${{ steps.tf.outputs.vm_size }}
+          VM_LOCATION: ${{ steps.tf.outputs.location }}
+        run: python scripts/update_servicenow.py

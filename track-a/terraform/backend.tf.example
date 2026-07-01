@@ -1,0 +1,26 @@
+# backend.tf.example — remote state for pipeline use.
+#
+# WHY: GitHub Actions runners are ephemeral. Local state (terraform.tfstate) would be
+# lost between runs, so Terraform couldn't track what it created. A remote backend in
+# Azure Storage lets every run share the same state — essential for idempotency and
+# for `terraform destroy` to work from a fresh runner.
+#
+# SETUP (run once, locally):
+#   RG=rg-tfstate
+#   SA=sttfstate$RANDOM          # must be globally unique, lowercase, 3-24 chars
+#   az group create -n $RG -l centralindia
+#   az storage account create -n $SA -g $RG --sku Standard_LRS --encryption-services blob
+#   az storage container create -n tfstate --account-name $SA
+#
+# Then copy this file to backend.tf and fill in the storage_account_name below.
+# (A Standard_LRS storage account holding a tiny state file costs effectively nothing,
+#  but delete it at the very end of the program: az group delete -n rg-tfstate --yes)
+
+terraform {
+  backend "azurerm" {
+    resource_group_name  = "rg-tfstate"
+    storage_account_name = "sttfstateCHANGEME"
+    container_name       = "tfstate"
+    key                  = "track-a-provision.tfstate"
+  }
+}
