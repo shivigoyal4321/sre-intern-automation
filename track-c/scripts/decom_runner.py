@@ -3,6 +3,7 @@ import sys
 import json
 import subprocess
 import requests
+import platform
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -18,6 +19,10 @@ if not INSTANCE or not USER or not PASSWORD:
 BASE_URL = f"https://{INSTANCE}.service-now.com/api/now/table"
 AUTH = (USER, PASSWORD)
 HEADERS = {"Accept": "application/json", "Content-Type": "application/json"}
+
+# On Windows, Azure CLI is installed as 'az.cmd' (a batch file).
+# Python's subprocess.run needs 'az.cmd' instead of 'az' to execute it successfully on Windows without spawning a shell.
+AZ_CMD = "az.cmd" if platform.system() == "Windows" else "az"
 
 
 def fetch_decom_request():
@@ -50,7 +55,7 @@ def parse_vm_name(description):
 def verify_azure_resource_group(rg_name):
     """Checks if resource group exists in Azure."""
     print(f"Checking if resource group '{rg_name}' exists in Azure...")
-    cmd = ["az", "group", "exists", "--name", rg_name]
+    cmd = [AZ_CMD, "group", "exists", "--name", rg_name]
     result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     return result.stdout.strip() == "true"
 
@@ -71,7 +76,7 @@ def destroy_azure_resources(rg_name):
 
     # Fallback to direct group deletion
     print(f"Deleting resource group '{rg_name}' directly via Azure CLI...")
-    cmd = ["az", "group", "delete", "--name", rg_name, "--yes"]
+    cmd = [AZ_CMD, "group", "delete", "--name", rg_name, "--yes"]
     result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     return result.returncode == 0
 
@@ -79,7 +84,7 @@ def destroy_azure_resources(rg_name):
 def verify_cleanup(rg_name):
     """Verifies that all resources in the resource group are deleted."""
     print(f"Verifying all resources in '{rg_name}' have been deleted...")
-    cmd = ["az", "resource", "list", "--resource-group", rg_name, "-o", "json"]
+    cmd = [AZ_CMD, "resource", "list", "--resource-group", rg_name, "-o", "json"]
     result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if result.returncode != 0:
         # If the command fails because the resource group was deleted entirely, then deletion was successful
