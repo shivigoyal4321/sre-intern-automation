@@ -1,0 +1,106 @@
+# provision.yml — Track A pipeline (PUSH trigger).
+# Triggered by ServiceNow Flow Designer via repository_dispatch, or manually for testing.
+# Located at the root of the repository to enable GitHub Actions.
+
+name: provision-vm
+
+on:
+  repository_dispatch:
+    types: [provision-vm]
+  workflow_dispatch:
+    inputs:
+      ritm_number:
+        description: "RITM number to process (manual test)"
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  # ServiceNow (from repo secrets)
+  SNOW_INSTANCE: ${{ secrets.SNOW_INSTANCE }}
+  SNOW_USER: ${{ secrets.SNOW_USER }}
+  SNOW_PASSWORD: ${{ secrets.SNOW_PASSWORD }}
+  # Azure / Terraform auth (from repo secrets)
+  ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+  ARM_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+  ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+  ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+jobs:
+  provision:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Resolve the RITM number from either trigger type
+      - name: Resolve RITM number
+        id: ritm
+        run: |
+          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+            echo "number=${{ github.event.client_payload.number }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "number=${{ github.event.inputs.ritm_number }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install script deps
+        working-directory: track-a
+        run: pip install -r scripts/requirements.txt
+
+      # --- Step 3: fetch the request from ServiceNow ---
+      - name: Fetch RITM details
+        id: fetch
+        working-directory: track-a
+        env:
+          RITM_NUMBER: ${{ steps.ritm.outputs.number }}
+          VM_NAME: ${{ github.event.client_payload.vm_name }}
+          VM_SIZE: ${{ github.event.client_payload.vm_size }}
+          REGION: ${{ github.event.client_payload.region }}
+        run: python scripts/fetch_request.py
+
+      - uses: hashicorp/setup-terraform@v3
+
+      # Provide the SSH public key Terraform needs (store it as a secret)
+      - name: Write SSH public key tfvar
+        working-directory: track-a
+        run: |
+          echo '${{ secrets.VM_SSH_PUBLIC_KEY }}' > terraform/ssh_key.pub
+          echo "ssh_public_key = \"$(cat terraform/ssh_key.pub)\"" >> terraform/terraform.tfvars
+
+      # --- Step 4: provision with Terraform ---
+      - name: Terraform Init
+        working-directory: track-a/terraform
+        run: terraform init
+
+      - name: Terraform Apply
+        working-directory: track-a/terraform
+        run: terraform apply -auto-approve
+
+      - name: Capture outputs
+        id: tf
+        working-directory: track-a/terraform
+        run: |
+          echo "vm_name=$(terraform output -raw vm_name)" >> "$GITHUB_OUTPUT"
+          echo "private_ip=$(terraform output -raw private_ip)" >> "$GITHUB_OUTPUT"
+          echo "vm_size=$(terraform output -raw vm_size)" >> "$GITHUB_OUTPUT"
+          echo "location=$(terraform output -raw location)" >> "$GITHUB_OUTPUT"
+
+      # --- Step 5: write back to ServiceNow (CMDB + RITM) ---
+      - name: Update ServiceNow
+        working-directory: track-a
+        env:
+          RITM_SYS_ID: ${{ steps.fetch.outputs.ritm_sys_id }}
+          VM_NAME: ${{ steps.tf.outputs.vm_name }}
+          VM_IP: ${{ steps.tf.outputs.private_ip }}
+          VM_SIZE: ${{ steps.tf.outputs.vm_size }}
+          VM_LOCATION: ${{ steps.tf.outputs.location }}
+        run: python scripts/update_servicenow.py
+
+      - name: Summary
+        run: |
+          echo "### ✅ Provisioned ${{ steps.tf.outputs.vm_name }} (${{ steps.tf.outputs.private_ip }})" >> "$GITHUB_STEP_SUMMARY"
+          echo "Remember to run \`terraform destroy\` when finished — see Track A Section 9." >> "$GITHUB_STEP_SUMMARY"
