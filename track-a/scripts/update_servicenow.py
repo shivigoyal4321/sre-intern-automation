@@ -1,6 +1,9 @@
 import os
 import sys
 import requests
+from dotenv import load_dotenv
+
+load_dotenv()
 
 INSTANCE = os.environ["SNOW_INSTANCE"]
 AUTH = (os.environ["SNOW_USER"], os.environ["SNOW_PASSWORD"])
